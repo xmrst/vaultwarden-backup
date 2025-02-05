@@ -4,6 +4,7 @@ set -e
 CONFIG_DIR="$HOME/.config/vaultwarden_backup"
 ACCOUNTS_FILE="$CONFIG_DIR/accounts"
 BACKUP_ROOT="$HOME/vaultwarden"
+CRON_TAG="VAULTWARDEN_BACKUP"
 
 # Initialize configuration
 mkdir -p "$CONFIG_DIR" "$BACKUP_ROOT"/{scripts,exports,tmp}
@@ -19,12 +20,12 @@ install_dependencies() {
     export PATH=$PATH:/snap/bin
 }
 
-add_account() {
-    # Check dependencies
-    if ! command -v bw &> /dev/null || ! command -v secret-tool &> /dev/null; then
-        install_dependencies
-    fi
+generate_cron_time() {
+    # Generate random minute (0-59) and hour (0-23)
+    echo "$(( RANDOM % 59 )) $(( RANDOM % 23 ))"
+}
 
+add_account() {
     echo "Adding new Vaultwarden account:"
     read -p "Email: " email
     read -p "Server URL: " server_url
@@ -42,7 +43,11 @@ add_account() {
     # Add to accounts list
     if ! grep -qxF "$email" "$ACCOUNTS_FILE"; then
         echo "$email" >> "$ACCOUNTS_FILE"
-        echo "Account added successfully!"
+        # Add cron job with random time
+        read -r minute hour <<< "$(generate_cron_time)"
+        cron_entry="$minute $hour * * * \"$0\" backup \"$email\" # $CRON_TAG:$email"
+        (crontab -l 2>/dev/null | grep -v "# $CRON_TAG:$email"; echo "$cron_entry") | crontab -
+        echo "Account added with daily backup at $hour:$minute UTC"
     else
         echo "Account already exists!"
     fi
@@ -53,29 +58,43 @@ remove_account() {
     cat "$ACCOUNTS_FILE"
     read -p "Enter email to remove: " email
 
+    # Remove credentials
     secret-tool clear service vaultwarden-backup account "${email}_email"
     secret-tool clear service vaultwarden-backup account "${email}_bw_password"
     secret-tool clear service vaultwarden-backup account "${email}_export_password"
     secret-tool clear service vaultwarden-backup account "${email}_server_url"
 
+    # Remove from accounts list and cron
     sed -i "/^$email$/d" "$ACCOUNTS_FILE"
-    echo "Account removed successfully!"
+    (crontab -l 2>/dev/null | grep -v "# $CRON_TAG:$email") | crontab -
+    echo "Account and associated cron job removed"
 }
 
 list_accounts() {
     echo "Registered Vaultwarden accounts:"
     cat "$ACCOUNTS_FILE"
+    echo -e "\nCron schedule:"
+    crontab -l | grep "# $CRON_TAG" | sed 's/#.*//'
 }
 
 backup() {
+    local email="${1:-all}"
     export PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin:/snap/bin
     LOGFILE="$BACKUP_ROOT/scripts/bitwarden_backup.log"
+    TIMESTAMP=$(date +%m-%d-%Y-%H-%M)
 
     exec > >(tee -a "$LOGFILE") 2>&1
     echo -e "\n=== $(date) ==="
 
-    while IFS= read -r email; do
-        if [[ -z "$email" ]]; then continue; fi
+    # Determine accounts to process
+    if [[ "$email" != "all" ]]; then
+        accounts=("$email")
+    else
+        mapfile -t accounts < "$ACCOUNTS_FILE"
+    fi
+
+    for email in "${accounts[@]}"; do
+        [[ -z "$email" ]] && continue
 
         echo "Processing account: $email"
         
@@ -106,7 +125,7 @@ backup() {
             bw_session=$(cat /tmp/bw_session)
             unlock_session=$(bw unlock --raw --passwordfile "$bw_pass_file" --session "$bw_session")
             
-            export_file="$BACKUP_ROOT/exports/vaultwarden-backup-${email}-$(date +%m-%d-%Y-%H-%M).json"
+            export_file="$BACKUP_ROOT/exports/vaultwarden-backup-${email}-${TIMESTAMP}.json"
             bw export --format encrypted_json --raw --password "$(cat "$export_pw_file")" --session "$unlock_session" > "$export_file"
             
             bw logout --session "$unlock_session" &>/dev/null
@@ -117,11 +136,12 @@ backup() {
 
         # Cleanup
         rm -f "$bw_pass_file" "$export_pw_file" /tmp/bw_session
-    done < "$ACCOUNTS_FILE"
+    done
 }
 
 case "$1" in
     add)
+        install_dependencies
         add_account
         ;;
     remove)
@@ -131,29 +151,14 @@ case "$1" in
         list_accounts
         ;;
     backup)
-        backup
+        backup "${2:-all}"
         ;;
     *)
-        echo "Usage: $0 {add|remove|list|backup}"
+        echo "Usage: $0 {add|remove|list|backup [email]}"
         echo "Manage multiple Vaultwarden backup accounts:"
-        echo "  add     - Add new account"
-        echo "  remove  - Remove existing account"
-        echo "  list    - Show registered accounts"
-        echo "  backup  - Run manual backup (automated hourly via cron)"
+        echo "  add              - Add new account with random daily schedule"
+        echo "  remove           - Remove existing account"
+        echo "  list             - Show registered accounts and schedules"
+        echo "  backup [email]   - Run manual backup (all or specific account)"
         exit 1
 esac
-
-# First run setup
-if [[ ! -f "$BACKUP_ROOT/scripts/bitwarden_backup.sh" ]]; then
-    cat > "$BACKUP_ROOT/scripts/bitwarden_backup.sh" << EOF
-#!/bin/bash
-"$0" backup
-EOF
-    chmod +x "$BACKUP_ROOT/scripts/bitwarden_backup.sh"
-    
-    # Add cron job
-    cron_entry="0 * * * * $BACKUP_ROOT/scripts/bitwarden_backup.sh"
-    if ! crontab -l | grep -qF "$cron_entry"; then
-        (crontab -l 2>/dev/null; echo "$cron_entry") | crontab -
-    fi
-fi
