@@ -1,13 +1,30 @@
 #!/bin/bash
 set -e
 
+# Installation parameters
+INSTALL_DIR="$HOME/vaultwarden/scripts"
+SCRIPT_NAME="vaultwarden_backup.sh"
+INSTALLED_SCRIPT="$INSTALL_DIR/$SCRIPT_NAME"
+CRON_TAG="VAULTWARDEN_BACKUP"
 CONFIG_DIR="$HOME/.config/vaultwarden_backup"
 ACCOUNTS_FILE="$CONFIG_DIR/accounts"
 BACKUP_ROOT="$HOME/vaultwarden"
-CRON_TAG="VAULTWARDEN_BACKUP"
+LOG_FILE="$BACKUP_ROOT/scripts/bitwarden_backup.log"
 
-# Initialize configuration
-mkdir -p "$CONFIG_DIR" "$BACKUP_ROOT"/{scripts,exports,tmp}
+# Self-installation check
+if [[ "$(realpath "$0")" != "$(realpath "$INSTALLED_SCRIPT")" ]]; then
+    echo "Installing script to $INSTALL_DIR..."
+    mkdir -p "$INSTALL_DIR" "$BACKUP_ROOT"/{exports,tmp} "$CONFIG_DIR"
+    chmod 700 "$BACKUP_ROOT"/{exports,tmp}
+    cp "$0" "$INSTALLED_SCRIPT"
+    chmod +x "$INSTALLED_SCRIPT"
+    echo "Installation complete. Re-executing with arguments..."
+    exec "$INSTALLED_SCRIPT" "$@"
+    exit $?
+fi
+
+# Initialize directories
+mkdir -p "$BACKUP_ROOT"/{exports,tmp} "$CONFIG_DIR"
 chmod 700 "$BACKUP_ROOT"/{exports,tmp}
 touch "$ACCOUNTS_FILE"
 
@@ -21,7 +38,6 @@ install_dependencies() {
 }
 
 generate_cron_time() {
-    # Generate random minute (0-59) and hour (0-23)
     echo "$(( RANDOM % 59 )) $(( RANDOM % 23 ))"
 }
 
@@ -45,9 +61,9 @@ add_account() {
         echo "$email" >> "$ACCOUNTS_FILE"
         # Add cron job with random time
         read -r minute hour <<< "$(generate_cron_time)"
-        cron_entry="$minute $hour * * * \"$0\" backup \"$email\" # $CRON_TAG:$email"
+        cron_entry="$minute $hour * * * \"$INSTALLED_SCRIPT\" backup \"$email\" # $CRON_TAG:$email"
         (crontab -l 2>/dev/null | grep -v "# $CRON_TAG:$email"; echo "$cron_entry") | crontab -
-        echo "Account added with daily backup at $hour:$minute UTC"
+        echo "Account added with daily backup at $(printf "%02d" "$hour"):$(printf "%02d" "$minute") UTC"
     else
         echo "Account already exists!"
     fi
@@ -74,16 +90,15 @@ list_accounts() {
     echo "Registered Vaultwarden accounts:"
     cat "$ACCOUNTS_FILE"
     echo -e "\nCron schedule:"
-    crontab -l | grep "# $CRON_TAG" | sed 's/#.*//'
+    crontab -l | grep "# $CRON_TAG" | awk '{$6=""; $7=""; print "  " $0}' | sed 's/#.*//'
 }
 
 backup() {
     local email="${1:-all}"
     export PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin:/snap/bin
-    LOGFILE="$BACKUP_ROOT/scripts/bitwarden_backup.log"
     TIMESTAMP=$(date +%m-%d-%Y-%H-%M)
 
-    exec > >(tee -a "$LOGFILE") 2>&1
+    exec > >(tee -a "$LOG_FILE") 2>&1
     echo -e "\n=== $(date) ==="
 
     # Determine accounts to process
@@ -139,6 +154,29 @@ backup() {
     done
 }
 
+uninstall() {
+    read -p "This will remove all backups, configurations, and cron jobs. Continue? [y/N] " confirm
+    if [[ "$confirm" =~ [yY] ]]; then
+        # Remove cron entries
+        (crontab -l 2>/dev/null | grep -v "# $CRON_TAG") | crontab -
+        
+        # Remove directories
+        rm -rf "$INSTALL_DIR" "$BACKUP_ROOT" "$CONFIG_DIR"
+        
+        # Remove secret-tool entries
+        while IFS= read -r email; do
+            secret-tool clear service vaultwarden-backup account "${email}_email"
+            secret-tool clear service vaultwarden-backup account "${email}_bw_password"
+            secret-tool clear service vaultwarden-backup account "${email}_export_password"
+            secret-tool clear service vaultwarden-backup account "${email}_server_url"
+        done < "$ACCOUNTS_FILE"
+        
+        echo "Vaultwarden backup system completely removed"
+    else
+        echo "Uninstall cancelled"
+    fi
+}
+
 case "$1" in
     add)
         install_dependencies
@@ -153,12 +191,16 @@ case "$1" in
     backup)
         backup "${2:-all}"
         ;;
+    uninstall)
+        uninstall
+        ;;
     *)
-        echo "Usage: $0 {add|remove|list|backup [email]}"
+        echo "Usage: $INSTALLED_SCRIPT {add|remove|list|backup|uninstall}"
         echo "Manage multiple Vaultwarden backup accounts:"
-        echo "  add              - Add new account with random daily schedule"
-        echo "  remove           - Remove existing account"
-        echo "  list             - Show registered accounts and schedules"
-        echo "  backup [email]   - Run manual backup (all or specific account)"
+        echo "  add        - Add new account with random daily schedule"
+        echo "  remove     - Remove existing account"
+        echo "  list       - Show registered accounts and schedules"
+        echo "  backup     - Run manual backup"
+        echo "  uninstall  - Remove all components and cron jobs"
         exit 1
 esac
