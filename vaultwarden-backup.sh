@@ -140,7 +140,7 @@ backup() {
             bw_session=$(cat /tmp/bw_session)
             unlock_session=$(bw unlock --raw --passwordfile "$bw_pass_file" --session "$bw_session")
             
-            export_file="$BACKUP_ROOT/exports/vaultwarden-backup-${email}-${TIMESTAMP}.json"
+            export_file="$BACKUP_ROOT/exports/${email}-${TIMESTAMP}.json"
             bw export --format encrypted_json --raw --password "$(cat "$export_pw_file")" --session "$unlock_session" > "$export_file"
             
             bw logout --session "$unlock_session" &>/dev/null
